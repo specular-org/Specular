@@ -390,15 +390,19 @@ def live_owned_tasks(work: Path, owner: Path) -> list[Path]:
     return live
 
 
-def wait_owned_tasks(work: Path, owner: Path, timeout: float) -> list[Path]:
+def wait_owned_tasks(work: Path, owner: Path, timeout: float, cancel: threading.Event | None = None) -> list[Path]:
     """Let this owner's tasks end on their own budgets, for at most ``timeout`` seconds.
 
-    Returns the tasks still running at the deadline. Waiting neither stops nor
-    extends a task; the caller decides what to do with the ones left.
+    Returns the tasks still running at the deadline, or when ``cancel`` is set.
+    Waiting neither stops nor extends a task; the caller decides what to do with
+    the ones left.
     """
     deadline = time.monotonic() + timeout
     while (live := live_owned_tasks(work, owner)) and (remaining := deadline - time.monotonic()) > 0:
-        time.sleep(min(OWNED_WAIT_POLL_SECONDS, remaining))
+        if cancel is None:
+            time.sleep(min(OWNED_WAIT_POLL_SECONDS, remaining))
+        elif cancel.wait(min(OWNED_WAIT_POLL_SECONDS, remaining)):
+            break
     return live
 
 

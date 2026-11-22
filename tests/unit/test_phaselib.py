@@ -41,6 +41,7 @@ import time
 import unittest
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypedDict, cast
@@ -3194,6 +3195,63 @@ class TestRunAgentBlocking(PhaseCase):
         # The final stop still tears down what is left.
         self.assertTrue((job / "stop.json").is_file())
 
+    def test_interrupt_ends_a_worker_threads_policy_tlc_wait(self) -> None:
+        adapter = self._policy_stop_adapter()
+        root = self.tmp()
+        job, _ = _running_tlc_task(self, self.work_dir(), root / "turn.log")
+        for var, value in (
+            ("COUNT_FILE", root / "count"),
+            ("SEEN_FILE", root / "seen"),
+            ("RESULT_FILE", job / "result.json"),
+            ("EXIT_AFTER", 99),
+            ("FINAL_RC", 0),
+        ):
+            self.set_env(var, str(value))
+        # Only the cancellation can end this wait promptly.
+        self.patch_attr(phaselib, "POLICY_TLC_WAIT_SECONDS", 60)
+        self.patch_attr(tlc_tasks, "OWNED_WAIT_POLL_SECONDS", 60)
+        self.addCleanup(phaselib._POLICY_TLC_WAIT_CANCEL.clear)
+        started = time.monotonic()
+
+        with (
+            self.assertRaises(KeyboardInterrupt),
+            ThreadPoolExecutor(max_workers=1) as pool,
+            phaselib.cancel_policy_tlc_waits_on_interrupt(),
+        ):
+            future = pool.submit(
+                phaselib.run_agent_blocking,
+                adapter,
+                "original prompt",
+                root / "prompt.md",
+                root / "turn.log",
+                phase_key="bug_confirmation",
+                work_dir=self.work_dir(),
+                claude_alias="profile",
+                policy_retries=2,
+            )
+            deadline = time.monotonic() + 10
+            while not (root / "count").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.2)
+            raise KeyboardInterrupt
+
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIsInstance(future.exception(), phaselib.PolicyTlcWaitCancelled)
+        # No retry started, and the turn's cleanup stopped its task.
+        self.assertEqual((root / "count").read_text(), "x")
+        self.assertTrue((job / "stop.json").is_file())
+
+    def test_cancelled_turn_without_running_tlc_tasks_starts_no_retry(self) -> None:
+        adapter = self._policy_stop_adapter()
+        root = self.tmp()
+        phaselib._POLICY_TLC_WAIT_CANCEL.set()
+        self.addCleanup(phaselib._POLICY_TLC_WAIT_CANCEL.clear)
+
+        with self.assertRaises(phaselib.PolicyTlcWaitCancelled):
+            self._run_policy_turn(adapter, root, root / "no-task", 2, 99, 0)
+
+        self.assertEqual((root / "count").read_text(), "x")
+
     def test_no_tlc_wait_without_a_policy_stop_or_a_running_task(self) -> None:
         adapter = self._policy_stop_adapter()
         self.patch_attr(tlc_tasks, "wait_owned_tasks", mock.Mock(side_effect=AssertionError("unexpected wait")))
@@ -4225,7 +4283,7 @@ class TestProgressReporting(PhaseCase):
         self.assertIn(f"{NAME}: final", output.getvalue())
         self.assertIn(f"{NAME}: completed (exit 0)", output.getvalue())
 
-    def test_reaper_keeps_tlc_tasks_for_a_policy_retry(self) -> None:
+    def test_reaper_leaves_tlc_tasks_of_a_policy_stop_to_its_caller(self) -> None:
         root = self.work_dir()
         log = root / "agent.log"
         job = root / ".tlc-tasks/jobs/task-1"
@@ -4233,8 +4291,8 @@ class TestProgressReporting(PhaseCase):
         (job / "request.json").write_text(json.dumps({"owner": str(log.resolve())}))
         self.patch_attr(phaselib, "AGENT_TERMINATION_GRACE_SECONDS", 0.05)
         phase = phaselib.Phase()
-        # A retried policy block keeps the task; a final policy block or any other exit stops it.
-        for rc, policy_attempt, stopped in ((76, 0, False), (76, phase._policy_retries, True), (1, 0, True)):
+        # The caller waits for a policy stop's tasks, then retries or stops them; any other exit stops them.
+        for rc, policy_attempt, stopped in ((76, 0, False), (76, phase._policy_retries, False), (1, 0, True)):
             with self.subTest(rc=rc, policy_attempt=policy_attempt):
                 (job / "stop.json").unlink(missing_ok=True)
                 proc = subprocess.Popen(
@@ -4266,62 +4324,178 @@ class TestProgressReporting(PhaseCase):
                     self.assertLess(time.time(), deadline, "adapter background process remained active")
                     time.sleep(0.01)
 
-    def test_reaper_stops_the_agent_then_waits_for_running_tlc_tasks_after_a_policy_stop(self) -> None:
-        root = self.work_dir()
-        log = root / "agent.log"
+    def record_resource_calls(self, job: Path) -> list[tuple[str, str, bool]]:
+        """Record (call, target, whether ``job`` had ended) for each resource pause/finish."""
+        calls: list[tuple[str, str, bool]] = []
+        for call in ("pause", "finish"):
+            self.patch_attr(
+                phaselib,
+                f"_resource_{call}_target",
+                lambda name, call=call: calls.append(
+                    (call, name, (job / "result.json").exists() or (job / "stop.json").exists())
+                ),
+            )
+        return calls
+
+    def test_policy_stop_waits_for_its_tlc_tasks_while_other_targets_run(self) -> None:
+        marks = self.tmp()
+        job, finish = _running_tlc_task(self, self.work_dir("a"), self.work_dir("a") / "agent.log")
+        self.write_adapter(
+            'name=$(basename "$(dirname "$SPECULAR_WORK_DIR")")\n'
+            f'printf x >> "{marks}/$name"\n'
+            f'if [ "$name" = b ]; then while [ ! -e "{marks}/a" ]; do sleep 0.01; done; sleep 1; '
+            f'touch "{marks}/b-ran"; exit 0; fi\n'
+            f'if [ -e "{job}/result.json" ]; then echo finished; else echo running; fi >> "{marks}/a-seen"\n'
+            f'[ "$(wc -c < "{marks}/a")" -lt 2 ] && exit 76\n'
+            "exit 0\n"
+        )
         self.patch_attr(phaselib, "AGENT_TERMINATION_GRACE_SECONDS", 0.05)
         self.patch_attr(tlc_tasks, "OWNED_WAIT_POLL_SECONDS", 0.01)
-        phase = phaselib.Phase()
-        # A retried and a final policy stop both wait; the final one then tears down.
-        for policy_attempt in (0, phase._policy_retries):
-            with self.subTest(policy_attempt=policy_attempt):
-                job, finish = _running_tlc_task(self, root, log)
-                proc = subprocess.Popen(
-                    ["sh", "-c", f"sleep 30 & echo $!; exit {POLICY_BLOCKED_RC}"],
-                    stdout=subprocess.PIPE,
-                    start_new_session=True,
-                )
-                assert proc.stdout is not None
-                child = Path(f"/proc/{int(proc.stdout.readline())}/status")
-                proc.stdout.close()
-                proc.wait()
-                agent_alive_at_finish: list[bool] = []
+        # A scheduler that blocked on this wait would reap b only after it.
+        self.patch_attr(phaselib, "POLICY_TLC_WAIT_SECONDS", 10)
+        resource_calls = self.record_resource_calls(job)
+        finisher = _finish_after(marks / "b-ran", finish, delay=1.0)
 
-                def finish_task(
-                    child: Path = child, finish: Callable[[], None] = finish, alive: list[bool] = agent_alive_at_finish
-                ) -> None:
-                    with contextlib.suppress(OSError):
-                        alive.append("State:\tZ" not in child.read_text(errors="replace"))
-                    finish()
+        rc, out = self.run_phase(
+            "code_analysis",
+            ["--max-parallel=2", f"--agent={self.adapter.stem}", self.artifact_flag(), "a|g|Go|r", "b|g|Go|r"],
+        )
+        finisher.join()
 
-                finisher = threading.Timer(0.3, finish_task)
-                agent = RunningAgent(
-                    name=NAME,
-                    proc=proc,
-                    work_dir=root,
-                    log=log,
-                    activity_log=root / "agent.activity.jsonl",
-                    ignored=set(),
-                    reported_snapshot={},
-                    log_stamp=None,
-                    activity_stamp=None,
-                    adapter_name="fake",
-                    policy_attempt=policy_attempt,
-                )
-                output = io.StringIO()
-                finisher.start()
-                with contextlib.redirect_stdout(output):
-                    live, completed = phase._reap_agents([agent], show_progress=False)
-                finisher.join()
+        self.assertEqual(rc, 0, out)
+        # b completed while a waited, and a's retry started after its task finished.
+        self.assertEqual((marks / "b").read_text(), "x")
+        self.assertEqual((marks / "a-seen").read_text().split(), ["running", "finished"])
+        waiting = out.index("a: waiting for 1 running TLC task(s) to finish before continuing")
+        self.assertLess(waiting, out.index("b: completed (exit 0)"))
+        self.assertLess(out.index("b: completed (exit 0)"), out.index("a: TLC wait over (0 task(s) still running)"))
+        self.assertFalse((job / "stop.json").exists())
+        # The wait counts as a's runtime: its pause comes when the wait ends.
+        self.assertIn(("pause", "a", True), resource_calls)
+        self.assertNotIn(("pause", "a", False), resource_calls)
 
-                self.assertEqual((live, completed), ([], [(agent, POLICY_BLOCKED_RC)]))
-                # The reaper returned only after the task finished, and the agent was stopped first.
-                self.assertTrue((job / "result.json").is_file())
-                self.assertFalse(any(agent_alive_at_finish))
-                self.assertFalse((job / "stop.json").exists())
-                self.assertIn(
-                    f"{NAME}: waiting for 1 running TLC task(s) to finish before continuing", output.getvalue()
-                )
+    def test_waiting_retry_keeps_its_slot_but_a_final_stop_frees_it(self) -> None:
+        marks = self.tmp()
+        job, finish = _running_tlc_task(self, self.work_dir("a"), self.work_dir("a") / "agent.log")
+        self.write_adapter(
+            'name=$(basename "$(dirname "$SPECULAR_WORK_DIR")")\n'
+            f'printf "%s\\n" "$name" >> "{marks}/order"\n'
+            f'[ "$name" = a ] && [ "$(wc -l < "{marks}/order")" -eq 1 ] && exit 76\n'
+            "exit 0\n"
+        )
+        self.patch_attr(phaselib, "AGENT_TERMINATION_GRACE_SECONDS", 0.05)
+        self.patch_attr(tlc_tasks, "OWNED_WAIT_POLL_SECONDS", 0.01)
+        self.patch_attr(phaselib, "POLICY_TLC_WAIT_SECONDS", 10)
+        finisher = _finish_after(marks / "order", finish)
+
+        rc, out = self.run_phase(
+            "code_analysis",
+            ["--max-parallel=1", f"--agent={self.adapter.stem}", self.artifact_flag(), "a|g|Go|r", "b|g|Go|r"],
+        )
+        finisher.join()
+
+        self.assertEqual(rc, 0, out)
+        self.assertIn("a: waiting for 1 running TLC task(s) to finish before continuing", out)
+        # The retry kept a's only slot: b ran after it.
+        self.assertEqual((marks / "order").read_text().split(), ["a", "a", "b"])
+
+        # A final stop has no retry to keep a slot for: b runs during a's wait.
+        marks = self.tmp()
+        job, _ = _running_tlc_task(self, self.work_dir("c"), self.work_dir("c") / "agent.log")
+        self.write_adapter(
+            'name=$(basename "$(dirname "$SPECULAR_WORK_DIR")")\n'
+            f'printf "%s\\n" "$name" >> "{marks}/order"\n'
+            '[ "$name" = c ] && exit 76\n'
+            "exit 0\n"
+        )
+        self.patch_attr(phaselib, "POLICY_TLC_WAIT_SECONDS", 2)
+
+        rc, out = self.run_phase(
+            "code_analysis",
+            [
+                "--max-parallel=1",
+                "--policy-retries=0",
+                f"--agent={self.adapter.stem}",
+                self.artifact_flag(),
+                "c|g|Go|r",
+                "d|g|Go|r",
+            ],
+        )
+
+        self.assertEqual(rc, POLICY_BLOCKED_RC, out)
+        self.assertEqual((marks / "order").read_text().split(), ["c", "d"])
+        self.assertLess(out.index("d: completed (exit 0)"), out.index("c: TLC wait over (1 task(s) still running)"))
+        self.assertTrue((job / "stop.json").is_file())
+
+    def test_dropped_policy_retry_still_waits_then_stops_its_tlc_tasks(self) -> None:
+        marks = self.tmp()
+        owner = self.work_dir("a") / "agent.log"
+        finishing, finish = _running_tlc_task(self, self.work_dir("a"), owner)
+        lasting, _ = _running_tlc_task(self, self.work_dir("a"), owner)
+        self.write_adapter(
+            'name=$(basename "$(dirname "$SPECULAR_WORK_DIR")")\n'
+            f'printf x >> "{marks}/$name"\n'
+            f'if [ "$name" = b ]; then while [ ! -e "{marks}/a" ]; do sleep 0.01; done; sleep 0.2; '
+            f'touch "{marks}/b-done"; exit 75; fi\n'
+            "exit 76\n"
+        )
+        self.patch_attr(phaselib, "AGENT_TERMINATION_GRACE_SECONDS", 0.05)
+        self.patch_attr(tlc_tasks, "OWNED_WAIT_POLL_SECONDS", 0.01)
+        self.patch_attr(phaselib, "POLICY_TLC_WAIT_SECONDS", 3)
+        finisher = _finish_after(marks / "b-done", finish, delay=0.5)
+
+        rc, out = self.run_phase(
+            "code_analysis",
+            ["--max-parallel=2", f"--agent={self.adapter.stem}", self.artifact_flag(), "a|g|Go|r", "b|g|Go|r"],
+        )
+        finisher.join()
+
+        self.assertEqual(rc, quota.RATE_LIMIT_RC, out)
+        self.assertEqual((marks / "a").read_text(), "x")
+        self.assertIn("skipping 1 unstarted target(s): a", out)
+        # The rate limit dropped a's retry, but not its wait: one task finished on its
+        # own, and the one left at the deadline was stopped.
+        self.assertFalse((finishing / "stop.json").exists())
+        self.assertTrue((lasting / "stop.json").is_file())
+        self.assertIn("a: TLC wait over (1 task(s) still running)", out)
+
+    def test_final_policy_stop_stops_tlc_tasks_left_at_the_wait_deadline(self) -> None:
+        job, _ = _running_tlc_task(self, self.work_dir(), self.work_dir() / "agent.log")
+        self.write_adapter("exit 76\n")
+        self.patch_attr(phaselib, "AGENT_TERMINATION_GRACE_SECONDS", 0.05)
+        self.patch_attr(tlc_tasks, "OWNED_WAIT_POLL_SECONDS", 0.01)
+        self.patch_attr(phaselib, "POLICY_TLC_WAIT_SECONDS", 0.2)
+        resource_calls = self.record_resource_calls(job)
+
+        rc, out = self.run_phase(
+            "code_analysis", ["--policy-retries=0", f"--agent={self.adapter.stem}", self.artifact_flag(), NAME]
+        )
+
+        self.assertEqual(rc, POLICY_BLOCKED_RC, out)
+        self.assertTrue((job / "stop.json").is_file())
+        # The phase ends only after the wait and the teardown, and the target finishes after it.
+        self.assertLess(
+            out.index(f"{NAME}: TLC wait over (1 task(s) still running)"), out.index("All agents completed.")
+        )
+        self.assertEqual(resource_calls, [("finish", NAME, True)])
+
+    def test_interrupt_during_a_policy_tlc_wait_stops_the_tasks(self) -> None:
+        job, _ = _running_tlc_task(self, self.work_dir(), self.work_dir() / "agent.log")
+        self.write_adapter("exit 76\n")
+        self.patch_attr(phaselib, "AGENT_TERMINATION_GRACE_SECONDS", 0.05)
+        original = phaselib.Phase._settle_policy_tlc_waits
+
+        def settle(phase: phaselib.Phase, waits: dict[str, Any]) -> None:
+            if waits:
+                raise KeyboardInterrupt
+            original(phase, waits)
+
+        self.patch_attr(phaselib.Phase, "_settle_policy_tlc_waits", settle)
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_fake()
+
+        self.assertTrue((job / "stop.json").is_file())
 
     def test_post_spawn_pid_write_failure_cleans_up_unregistered_agent(self) -> None:
         self.write_adapter("sleep 30\n")
@@ -5020,6 +5194,51 @@ class TestReviewPhase(PhaseCase):
             )
 
         self.assertFalse(marker.exists())
+
+    def test_review_policy_stop_waits_then_keeps_or_stops_tlc_tasks(self) -> None:
+        adapter = self.install_adapter("fake", "exit 76\n")
+        self.patch_attr(phaselib, "AGENT_TERMINATION_GRACE_SECONDS", 0.05)
+        self.patch_attr(tlc_tasks, "OWNED_WAIT_POLL_SECONDS", 0.01)
+        self.patch_attr(phaselib, "POLICY_TLC_WAIT_SECONDS", 0.2)
+        self.set_env("SPECULAR_PROGRESS", "off")
+        review = self.review()
+        # A retried stop keeps what is left at the deadline; a final stop stops it.
+        for policy_attempt, stopped in ((0, False), (review._policy_retries, True)):
+            with self.subTest(policy_attempt=policy_attempt):
+                log = self.work_dir() / "review-analysis.log"
+                job, finish = _running_tlc_task(self, self.work_dir(), log)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    rc = review._launch_review(
+                        phaselib.Workspace([NAME]),
+                        NAME,
+                        "analysis",
+                        adapter,
+                        "profile",
+                        policy_attempt=policy_attempt,
+                    )
+                finish()
+
+                self.assertEqual(rc, POLICY_BLOCKED_RC)
+                self.assertIn(f"{NAME}: TLC wait over (1 task(s) still running)", output.getvalue())
+                self.assertEqual((job / "stop.json").is_file(), stopped)
+
+    def test_review_interrupted_during_its_tlc_wait_does_not_signal_the_reaped_agent(self) -> None:
+        adapter = self.install_adapter("fake", "exit 76\n")
+        self.patch_attr(phaselib, "AGENT_TERMINATION_GRACE_SECONDS", 0.05)
+        self.set_env("SPECULAR_PROGRESS", "off")
+        self.patch_attr(phaselib, "_wait_policy_tlc", mock.Mock(side_effect=KeyboardInterrupt))
+
+        with (
+            mock.patch.object(
+                phaselib.Phase, "_terminate_processes", wraps=phaselib.Phase._terminate_processes
+            ) as terminate,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.review()._launch_review(phaselib.Workspace([NAME]), NAME, "analysis", adapter, "profile")
+
+        # Only the reaper's own stop of the agent session; none after the wait began.
+        self.assertEqual(terminate.call_count, 1)
 
     def test_review_finishes_resource_record_before_resume_completion(self) -> None:
         self.seed(["modeling-brief.md"])

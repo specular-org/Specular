@@ -597,6 +597,24 @@ def test_wait_owned_tasks_ends_when_tasks_finish_or_at_the_deadline(
     assert not (path / "stop.json").exists()
 
 
+def test_wait_owned_tasks_ends_when_cancelled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tasks, "OWNED_WAIT_POLL_SECONDS", 30)
+    owner = tmp_path / "agent.log"
+    path, lock = owned_job(tmp_path, owner, "held")
+    assert lock is not None
+    cancel = threading.Event()
+    timer = threading.Timer(0.2, cancel.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        assert tasks.wait_owned_tasks(tmp_path, owner, 30, cancel) == [path]
+    finally:
+        timer.join()
+        os.close(lock)
+    assert time.monotonic() - started < 10
+    assert not (path / "stop.json").exists()
+
+
 @pytest.mark.asyncio
 async def test_waiting_for_owned_tasks_lets_a_real_task_finish(
     runtime: wrappers.RunModelCheckTests, monkeypatch: pytest.MonkeyPatch
