@@ -373,14 +373,33 @@ def _structured_policy_block_error(adapter_name: str, record: object) -> str | N
             payload = record.get("message")
         elif record.get("type") == "error":
             payload = record
-    elif adapter_name == "agy" and record.get("event") == "result":
-        res = record.get("result")
-        if isinstance(res, dict) and res.get("status") != "SUCCESS":
-            payload = res.get("error") if res.get("error") is not None else res
+    elif adapter_name == "agy":
+        payload = _agy_result_error(record)
 
     if payload is None or not looks_policy_blocked(payload):
         return None
     return _policy_diagnostic(payload) or "provider content policy blocked the request"
+
+
+# agy reports provider failures only in a failed result's ``error`` string,
+# after its own in-process retries are exhausted, e.g.
+# "API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable."
+_AGY_TRANSIENT_ERROR_RE = re.compile(
+    r"\(code (?:500|502|503|504)\)|\bMODEL_CAPACITY_EXHAUSTED\b|"
+    r"^API error \(attempt \d+\): request failed: .*: (?:unexpected )?EOF$|"
+    r"^The stream was interrupted\. Please continue the task you were working on\.$"
+)
+
+
+def _agy_result_error(record: dict[str, object]) -> str | None:
+    """The CLI's own error text of a failed agy result, never the agent's response."""
+    if record.get("event") != "result":
+        return None
+    res = record.get("result")
+    if not isinstance(res, dict) or res.get("status") == "SUCCESS":
+        return None
+    error = res.get("error")
+    return error if isinstance(error, str) and error.strip() else None
 
 
 def _structured_rate_limit_error(adapter_name: str, record: object) -> str | None:
@@ -406,10 +425,8 @@ def _structured_rate_limit_error(adapter_name: str, record: object) -> str | Non
             payload = record.get("message")
         elif record.get("type") == "error":
             payload = record
-    elif adapter_name == "agy" and record.get("event") == "result":
-        res = record.get("result")
-        if isinstance(res, dict) and res.get("status") != "SUCCESS":
-            payload = res.get("error") if res.get("error") is not None else res
+    elif adapter_name == "agy":
+        payload = _agy_result_error(record)
 
     if payload is None or not _looks_rate_limited(payload):
         return None
@@ -438,12 +455,15 @@ def _structured_transient_error(adapter_name: str, record: object) -> str | None
             payload = record.get("message")
         elif record.get("type") == "error":
             payload = record
-    elif adapter_name == "agy" and record.get("event") == "result":
-        res = record.get("result")
-        if isinstance(res, dict) and res.get("status") != "SUCCESS":
-            payload = res.get("error") if res.get("error") is not None else res
+    elif adapter_name == "agy":
+        payload = _agy_result_error(record)
 
-    if payload is None or not looks_transient(payload):
+    if payload is None:
+        return None
+    agy_transient = (
+        adapter_name == "agy" and isinstance(payload, str) and _AGY_TRANSIENT_ERROR_RE.search(payload.strip())
+    )
+    if not agy_transient and not looks_transient(payload):
         return None
     return _policy_diagnostic(payload) or "provider reported a transient failure"
 

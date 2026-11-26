@@ -271,3 +271,63 @@ def test_agy_skill_refs_materialize_local_paths() -> None:
     rendered = materialize_skill_refs(f"Use {prompt_skill_ids('code-analysis')}", "agy")
     assert "read the local Specular skill file at" in rendered
     assert "SKILL.md" in rendered
+
+
+def _run_fake_result(tmp_path: Path, name: str, result: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    bin_dir = tmp_path / f"bin-{name}"
+    bin_dir.mkdir()
+    _make_fake_agy(
+        bin_dir,
+        f"""
+import json, sys
+sys.stdin.read()
+print(json.dumps({{"event": "init", "conversation_id": "c1"}}))
+print(json.dumps({{"event": "result", "result": {{"conversation_id": "c1", **{result!r}}}}}))
+""",
+    )
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+    return subprocess.run(
+        [str(ADAPTER_SH), "--prompt=hi", f"--log={tmp_path / f'{name}.log'}"],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_agy_upstream_error_texts_are_classified(tmp_path: Path) -> None:
+    # Verbatim result.error strings reported upstream (google-antigravity/antigravity-cli
+    # #1018, #1518, #1517, #1446); agy has already retried these in-process.
+    cases = (
+        (
+            "API error (attempt 3): RESOURCE_EXHAUSTED (code 429): Individual quota reached. "
+            "Please upgrade your subscription to increase your limits. Resets in 2h39m52s.",
+            75,
+        ),
+        ("API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.", TRANSIENT_FAILURE_RC),
+        (
+            'API error (attempt 1): request failed: Post "https://cloudcode-pa.googleapis.com/'
+            'v1internal:streamGenerateContent?alt=sse": EOF',
+            TRANSIENT_FAILURE_RC,
+        ),
+        ("The stream was interrupted. Please continue the task you were working on.", TRANSIENT_FAILURE_RC),
+        ("failed to construct executor: unknown model key MODEL_PLACEHOLDER_M359: model not found", 1),
+        ("authentication failed or timed out", 1),
+    )
+    for index, (error_text, expected_rc) in enumerate(cases):
+        res = _run_fake_result(tmp_path, f"case{index}", {"status": "ERROR", "response": "", "error": error_text})
+        assert res.returncode == expected_rc, f"{error_text}: got {res.returncode}, stderr={res.stderr}"
+
+
+def test_agy_agent_response_text_is_not_a_provider_error(tmp_path: Path) -> None:
+    res = _run_fake_result(
+        tmp_path,
+        "prose",
+        {
+            "status": "CANCELED",
+            "response": "The replica returned HTTP 503 service unavailable after an upstream timeout.",
+        },
+    )
+    assert res.returncode == 1, res.stderr
