@@ -4140,6 +4140,26 @@ class TestValidationContracts(ConfirmCase):
             f"- **Status**: {status}{detail_statuses}\n"
         )
 
+    @staticmethod
+    def _write_report_with_evidence_table(spec: Path) -> None:
+        """Entry 1's evidence quotes a table whose numeric rows look like disposition rows."""
+        (spec.parent / "confirmed-bugs.md").write_text(
+            "| Entry | Finding | Status | Counts as final bug? |\n"
+            "|---|---|---|---|\n"
+            "| 1 | MC-1 | PENDING REPAIR (RR-001) | no |\n"
+            "| 2 | CR-1 | REPRODUCED | yes |\n\n"
+            "## Entry 1: pending model finding\n\n"
+            "- **Finding ID**: MC-1\n"
+            "- **Status**: PENDING REPAIR (RR-001)\n\n"
+            "| Step | Action | Observation |\n"
+            "|---|---|---|\n"
+            "| 3 | `MCCancelOuter` | `task.cancel(true) returned true` |\n"
+            "| 4 | MC-1 | PENDING REPAIR (RR-009) |\n\n"
+            "## Entry 2: reproduced review finding\n\n"
+            "- **Finding ID**: CR-1\n"
+            "- **Status**: REPRODUCED\n"
+        )
+
     def test_structural_hygiene_still_enforced(self) -> None:
         # Kept (would break the per-finding fan-out): id filesystem-safe + unique,
         # source routable. Everything else was intentionally relaxed.
@@ -4592,6 +4612,41 @@ class TestValidationContracts(ConfirmCase):
                 self._write_repair_report(spec, rendered)
                 with self.assertRaisesRegex(C.InvalidRepairRequest, "invalid status"):
                     C.validate_report_repair_references(self.cfg(ws, rendered.replace(" ", "_")))
+
+    def test_prior_report_import_ignores_tables_inside_entry_evidence(self) -> None:
+        ws = self.seed("T", [])
+        self._write_report_with_evidence_table(ws.work_dir("T") / "spec")
+
+        catalog, outcomes = C._prior_report_catalog(self.cfg(ws, "T"))
+
+        self.assertEqual([item["id"] for item in catalog], ["MC-1", "CR-1"])
+        self.assertEqual(
+            [(o.bug_no, o.status, o.rr) for o in outcomes],
+            [(1, "PENDING REPAIR", "RR-001"), (2, "REPRODUCED", None)],
+        )
+        self.assertIn("task.cancel(true) returned true", outcomes[0].body)
+
+    def test_report_repair_readers_ignore_tables_inside_entry_evidence(self) -> None:
+        ws = self.seed("T", [])
+        spec = ws.work_dir("T") / "spec"
+        self._write_report_with_evidence_table(spec)
+        rr_dir = spec / "repair-requests"
+        rr_dir.mkdir()
+        (rr_dir / "RR-001.md").write_text(
+            C._merge_rr(
+                "RR-001",
+                "Bug 1",
+                "fallback.out",
+                TestMergeRR.AGENT_BODY,
+                finding_id="MC-1",
+                allocation_key="key",
+            )
+        )
+        cfg = self.cfg(ws, "T")
+
+        C.validate_report_repair_references(cfg)
+        self.assertEqual(C._legacy_rr_report_identity(cfg, "RR-001"), ("MC-1", "Bug 1"))
+        self.assertIsNone(C._legacy_rr_report_identity(cfg, "RR-009", require_reference=False))
 
     def test_unprovable_legacy_rr_identity_fails_closed_without_duplicate(self) -> None:
         ws = self.seed("T", [])

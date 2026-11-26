@@ -3176,6 +3176,12 @@ _REPORT_DETAIL_RE = re.compile(r"(?m)^##\s+(?:Bug|Entry)\s+(\d+)\s*:")
 _REPORT_STATUS_FIELD_RE = re.compile(r"^\s*-\s*\*\*Status\*\*:", re.I)
 
 
+def _report_table_rows(text: str) -> list[re.Match[str]]:
+    """Disposition-table rows only; tables quoted inside Entry evidence are not rows."""
+    first_detail = _REPORT_DETAIL_RE.search(text)
+    return list(_REPORT_RR_ROW_RE.finditer(text, 0, first_detail.start() if first_detail else len(text)))
+
+
 def _report_repair_status_key(status: str, rid: str) -> str | None:
     status = status.strip()
     if status in {"PENDING REPAIR", f"PENDING REPAIR ({rid})"}:
@@ -3208,7 +3214,7 @@ def _legacy_rr_report_identity(
         raise InvalidRepairRequest(f"cannot migrate legacy repair {rid}: confirmed-bugs.md is missing or unsafe")
     text = report.read_text()
     rows: list[tuple[int, str]] = []
-    for match in _REPORT_RR_ROW_RE.finditer(text):
+    for match in _report_table_rows(text):
         rr_refs = re.findall(r"\bRR-\d+\b", match.group(3))
         if rid in rr_refs:
             rows.append((int(match.group(1)), match.group(2)))
@@ -3233,7 +3239,7 @@ def _legacy_rr_report_identity(
         raise InvalidRepairRequest(
             f"cannot migrate legacy repair {rid}: report detail does not prove finding_id {finding_id}"
         )
-    if sum(1 for match in _REPORT_RR_ROW_RE.finditer(text) if match.group(2) == finding_id) != 1:
+    if sum(1 for match in _report_table_rows(text) if match.group(2) == finding_id) != 1:
         raise InvalidRepairRequest(
             f"cannot migrate legacy repair {rid}: finding_id {finding_id} is not unique in the report"
         )
@@ -3353,7 +3359,7 @@ def validate_report_repair_references(cfg: ConfirmConfig) -> None:
     rr_dir = cfg.ws.work_dir(cfg.name) / "spec" / "repair-requests"
     details = list(_REPORT_DETAIL_RE.finditer(text))
     seen: set[str] = set()
-    for row in _REPORT_RR_ROW_RE.finditer(text):
+    for row in _report_table_rows(text):
         bug_no = int(row.group(1))
         rendered_status = row.group(3).strip()
         pending = re.fullmatch(r"PENDING REPAIR \((RR-\d+)\)", rendered_status)
@@ -4388,7 +4394,7 @@ def _prior_report_catalog(cfg: ConfirmConfig) -> tuple[list[dict[str, Any]], lis
     if report.is_symlink() or not report.is_file():
         return [], []
     text = report.read_text()
-    rows = list(_REPORT_RR_ROW_RE.finditer(text))
+    rows = _report_table_rows(text)
     details = list(_REPORT_DETAIL_RE.finditer(text))
     if not rows and not details:
         return [], []
