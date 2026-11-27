@@ -11,7 +11,7 @@ The report starts with the gaps, grouped: each row is a set of actions and the c
 - *possible*: it was enabled in those configs but not taken within the budget, so a longer run may close the gap;
 - *never possible*: it was never enabled in any state those configs visited, which usually means a limit or workload in the config rules it out.
 
-It then lists affected actions no config reached, and whether any config enables a temporal property. A full matrix of configs against actions follows.
+It then lists affected actions no config reached, and whether any config checks a liveness property, that is, a property whose definition or a definition it uses contains `<>` or `~>`. A `[][A]_vars` property is safety and does not count. A full matrix of configs against actions follows.
 
 It needs no agent and no changes to the spec. `--actions FILE.tla:DEF` points it at another definition for suites without `Update.tla`.
 
@@ -32,7 +32,7 @@ Every action in every gap is *never possible*. `MC_smoke.cfg` has an empty workl
 
 1. **Both gaps from the report are flagged in every version.** No ordinary config ever issues a V2 request, and every check enabled only in ordinary configs, `CampaignDecisionEligibility` included, is never run while one happens. Adding V2 to the workloads clears that.
 2. **It finds gaps the report did not mention.** With V2 added, V01 still has 8 checks that never run while a snapshot is created, because they are enabled only in hunts with `SnapshotLimit = 0`. V03 still has `RecoveryBacking` and `VoteRecovery`, which are enabled only in hunts with `TransferLimit = 0`, and leader transfer is part of the V03 update and of bug B. Both were checked against the config files. These are facts about the configs; whether they matter is a modeling call.
-3. **No config in any version enables a temporal property**, so a progress bug such as bug B cannot be caught by any configured run.
+3. **No config in any version checks a liveness property**, so a progress bug such as bug B cannot be caught by any configured run.
 4. **Fixing the configs is not enough on its own.** No config ever reached `Receive`, and it was never even enabled: random runs from Init never deliver a message, so no leader is elected. Twenty-minute simulations of the corrected V01 configs found nothing (`etcd/after-fix-simulation.md`). This matches `etcd-v0-v3/prefix-ablation/`: the right checks and a recorded starting point are both needed.
 
 ## Case study: MongoDB RaftReconfig
@@ -46,6 +46,18 @@ To see whether it works on a suite it was not built for, the check ran on `case-
 | `MCShutDown`, `MCRemoveNewlyAdded` (never possible) | `ConfigPropagationSafety` |
 
 Each *never possible* matches a limit of 0 in the configs that enable those checks. The first gap was worth a look: the three checks run only in `MC.cfg`, which has `ForceReconfigLimit = 0`. With the limit set to 1, `LeaderInOwnConfig` fails at state 9: a follower force-reconfigures to a config that leaves the leader out, and the leader adopts it and stays leader (`mongodb-raftreconfig/force-reconfig-check.md`). Either the model is missing a step-down or the invariant is not meant to hold under force reconfig. That is for the case study's authors to decide, but the combination had never been checked.
+
+The report also warns that no config checks liveness. Its one property, `NeverRollbackCommitted == [][~RollbackCommitted]_vars`, is safety.
+
+## Epoch-1 misses
+
+The check was rerun on the final specs of the seven epoch-1 misses (`inv-e2e/analysis/epoch-1/coverage/run_coverage.py`, same budgets). It catches none of them:
+
+- 010 v0 and 012 v2: the model cannot express the bug.
+- 011 B v0: the bound that hides it is a cfg constant on election rounds, below what an action-level check sees.
+- 002 v1, 011 B v1, 011 C v1 and 011 C v2: the scenario is reachable, but the agent argued it away. For 002 v1, the action involved is not in `AffectedActions`.
+
+Every spec, including all arms of 002 and 011, now gets the liveness warning. None checks a `<>` or `~>` property, so the Gold liveness bugs in 002 and 011 could not have been caught by any configured run. The gaps match the committed outputs, except that one sampled run in 002 v1 reached action 6 this time.
 
 ## Limits
 

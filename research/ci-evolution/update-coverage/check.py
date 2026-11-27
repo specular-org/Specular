@@ -47,6 +47,9 @@ CHECK_SECTIONS = {"INVARIANT": "invariant", "INVARIANTS": "invariant", "PROPERTY
 DEFINITION = re.compile(r"^([A-Za-z_]\w*)(\([^)]*\))?\s*==(.*)$")
 ACTION_NAME = re.compile(r"(?:Original!)?\b((?:MC)?[A-Z]\w*)\(")
 NOT_ACTIONS = {"Framed", "Last", "SeqSet", "Len", "Cardinality", "UNCHANGED"}
+# `<>` (eventually) or `~>` (leads to), but not the `<>` inside an empty tuple `<<>>`.
+EVENTUALLY = re.compile(r"~>|(?<![<>])<>(?![<>])")
+IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
 
 
 @dataclass
@@ -169,6 +172,37 @@ def split_config(text: str) -> tuple[dict[str, str], str]:
     return checks, "\n".join(kept).strip() + "\n"
 
 
+def spec_definitions(spec: Path) -> dict[str, str]:
+    """Every top-level definition in the spec's modules; a name defined in several modules keeps all bodies."""
+    definitions: dict[str, str] = {}
+    for path in sorted(spec.glob("*.tla")):
+        for name, body in top_level_definitions(strip_comments(path.read_text(errors="replace"))).items():
+            definitions[name] = f"{definitions[name]}\n{body}" if name in definitions else body
+    return definitions
+
+
+def is_liveness(name: str, definitions: dict[str, str]) -> bool:
+    """A property is liveness if it, or a definition it uses, says something must eventually happen."""
+    seen: set[str] = set()
+    todo = [name]
+    while todo:
+        current = todo.pop()
+        if current in seen or current not in definitions:
+            continue
+        seen.add(current)
+        if EVENTUALLY.search(definitions[current]):
+            return True
+        todo += IDENTIFIER.findall(definitions[current])
+    return False
+
+
+def classify(checks: dict[str, str], definitions: dict[str, str]) -> dict[str, str]:
+    return {
+        name: "liveness" if kind != "invariant" and is_liveness(name, definitions) else kind
+        for name, kind in checks.items()
+    }
+
+
 def probe_module(probes: list[Probe], extends: str = "Update") -> str:
     registers = " /\\ ".join(f"TLCSet({100 + p.index}, 0) /\\ TLCSet({300 + p.index}, 0)" for p in probes)
     lines = [
@@ -217,7 +251,8 @@ def run_config(
     jars: str,
 ) -> Config:
     """Run one simulation and merge what it reached into the config, so a retry adds to the first run."""
-    config.checks, body = split_config((spec / config.name).read_text())
+    checks, body = split_config((spec / config.name).read_text())
+    config.checks = classify(checks, spec_definitions(spec))
     work = Path(tempfile.mkdtemp(prefix="update-coverage-"))
     try:
         for path in spec.glob("*.tla"):
@@ -294,7 +329,8 @@ def analyse(probes: list[Probe], configs: list[Config], ignore: str | None = Non
         "unreached": [p.index for p in probes if p.index not in reached],
         "never_enabled": [p.index for p in probes if p.index not in ever_enabled],
         "gaps": gaps,
-        "properties": sorted(name for name, entry in checks.items() if entry["kind"] == "property"),
+        "properties": sorted(name for name, entry in checks.items() if entry["kind"] != "invariant"),
+        "liveness": sorted(name for name, entry in checks.items() if entry["kind"] == "liveness"),
         "errors": [{"config": c.name, "status": c.status} for c in configs if c.status.startswith("error")],
         "ignored": sorted({n for c in ran for n in c.checks if ignore and re.search(ignore, n)}),
     }
@@ -332,8 +368,8 @@ def report(spec_label: str, probes: list[Probe], configs: list[Config], result: 
     if result["unreached"]:
         parts = [f"{label[k]} ({'never possible' if k in never else 'possible'})" for k in result["unreached"]]
         lines += [f"Actions no config reached: {'; '.join(parts)}.", ""]
-    if not result["properties"]:
-        lines += ["No config enables a temporal property, so no progress obligation is checked.", ""]
+    if not result["liveness"]:
+        lines += ["No config checks a liveness property (one using `<>` or `~>`), so no progress is checked.", ""]
     if result["ignored"]:
         lines += ["Ignored as requested: " + ", ".join(f"`{name}`" for name in result["ignored"]) + ".", ""]
     for error in result["errors"]:
@@ -375,6 +411,11 @@ def main() -> None:
         record = json.loads((args.out / "report.json").read_text())
         probes = [Probe(**{**p, "label": probe_label(p["formula"])}) for p in record["probes"]]
         configs = [Config(**c) for c in record["configs"]]
+        spec = Path(record["spec"].replace("$SPECULA", str(ROOT)))
+        if spec.is_dir():
+            definitions = spec_definitions(spec)
+            for config in configs:
+                config.checks = classify(config.checks, definitions)
         write(args, record["spec"], record["settings"], probes, configs)
         return
     spec = args.spec.resolve()

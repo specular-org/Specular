@@ -667,6 +667,7 @@
   "properties": [
     "NeverRollbackCommitted"
   ],
+  "liveness": [],
   "errors": [],
   "ignored": [],
   "groups": [

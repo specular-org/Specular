@@ -6,7 +6,7 @@ None: every enabled check runs in a config that reaches every action some config
 
 Actions no config reached: 3 Receive (some message types) (never possible); 7 Receive (some message types) (never possible).
 
-No config enables a temporal property, so no progress obligation is checked.
+No config checks a liveness property (one using `<>` or `~>`), so no progress is checked.
 
 Ignored as requested: `AutoLeaveNotAppended`, `JointNotReached`, `JointRecoveryNotReached`, `LearnerGrantNotReached`, `OutgoingSnapshotRestoreNotReached`, `PostReadyOutputNotReached`.
 

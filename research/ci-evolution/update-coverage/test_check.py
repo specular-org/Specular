@@ -102,6 +102,7 @@ def test_analyse_reports_checks_never_run_with_a_reached_action() -> None:
         "never_enabled": [3],
         "gaps": [{"check": "Inv", "kind": "invariant", "configs": ["MC.cfg"], "missing": [1], "possible": []}],
         "properties": [],
+        "liveness": [],
         "errors": [{"config": "Broken.cfg", "status": "error: parse"}],
         "ignored": [],
     }
@@ -130,6 +131,55 @@ def test_enabled_but_untaken_actions_are_possible_and_groups_share_missing_actio
     assert "| 1 New (possible) | 2 | `I1`, `I2` |" in text
     assert "| 1 New (never possible) | 1 | `I3` |" in text
     assert "| `MC_hunt.cfg` | not run | - | None | . | x |" in text
+
+
+PROPERTIES = r"""---- MODULE MC ----
+Step(i) == leader' = i
+\* A comment that mentions <> must not count.
+ElectOnlyByVoter == [][\A i \in Server : Step(i) => i \in Voters]_vars
+EmptyQueue == [](queue = <<>> => <<>> = queue)
+Elected == \E i \in Server : leader = i
+EventuallyElected == []<>Elected
+RequestAnswered == \A r \in Requests : pending(r) ~> answered(r)
+Wrapped == EventuallyElected
+====
+"""
+
+
+def test_only_properties_that_use_eventually_or_leads_to_are_liveness(tmp_path: Path) -> None:
+    (tmp_path / "MC.tla").write_text(PROPERTIES)
+    definitions = check.spec_definitions(tmp_path)
+    kinds = check.classify(
+        {
+            "ElectOnlyByVoter": "property",
+            "EmptyQueue": "property",
+            "EventuallyElected": "property",
+            "RequestAnswered": "property",
+            "Wrapped": "property",
+            "Elected": "invariant",
+        },
+        definitions,
+    )
+    assert kinds == {
+        "ElectOnlyByVoter": "property",
+        "EmptyQueue": "property",
+        "EventuallyElected": "liveness",
+        "RequestAnswered": "liveness",
+        "Wrapped": "liveness",
+        "Elected": "invariant",
+    }
+
+
+def test_report_warns_when_no_config_checks_liveness() -> None:
+    probes = [check.Probe(1, "G", "New", "A")]
+    safety = [check.Config("MC.cfg", "MC", {"ElectOnlyByVoter": "property"}, taken=[1], status="budget used")]
+    result = check.analyse(probes, safety)
+    assert (result["properties"], result["liveness"]) == (["ElectOnlyByVoter"], [])
+    assert "No config checks a liveness property" in check.report("spec", probes, safety, result)
+    live = [check.Config("MC.cfg", "MC", {"EventuallyElected": "liveness"}, taken=[1], status="budget used")]
+    result = check.analyse(probes, live)
+    assert (result["properties"], result["liveness"]) == (["EventuallyElected"], ["EventuallyElected"])
+    assert "No config checks a liveness property" not in check.report("spec", probes, live, result)
 
 
 def test_comments_inside_a_definition_do_not_hide_its_disjuncts() -> None:

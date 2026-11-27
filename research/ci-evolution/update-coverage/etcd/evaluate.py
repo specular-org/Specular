@@ -42,15 +42,17 @@ def corrected_copy(spec: Path, destination: Path) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("versions", nargs="*", default=list(VERSIONS), choices=VERSIONS)
+    parser.add_argument("versions", nargs="*", metavar="VERSION", help=f"one of {', '.join(VERSIONS)}; default: all")
     parser.add_argument("--variants", nargs="*", default=["as-is", "v2-workload"], choices=["as-is", "v2-workload"])
     parser.add_argument("--seconds", type=int, default=180)
     parser.add_argument("--jobs", type=int, default=5)
     parser.add_argument("--reports", type=Path, default=HERE / "reports")
     parser.add_argument("--rebuild", action="store_true", help="rebuild reports from saved results without TLC")
     args = parser.parse_args()
+    if unknown := sorted(set(args.versions) - set(VERSIONS)):
+        parser.error(f"unknown version: {', '.join(unknown)}")
     with tempfile.TemporaryDirectory(prefix="update-coverage-etcd-") as scratch:
-        for version in args.versions:
+        for version in args.versions or VERSIONS:
             for variant in args.variants:
                 spec = SPECS / version
                 if variant == "v2-workload" and not args.rebuild:

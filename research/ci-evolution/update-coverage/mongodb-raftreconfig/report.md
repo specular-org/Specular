@@ -11,6 +11,8 @@ enable those checks; *possible* means it was enabled there but not taken within 
 | 6 MCRemoveNewlyAdded (never possible) | 3 | `ActiveConfigsOverlap`, `ArbiterQuorumOverlap`, `DrainModeReconfigSafety` |
 | 4 MCShutDown (never possible); 6 MCRemoveNewlyAdded (never possible) | 1 | `ConfigPropagationSafety` |
 
+No config checks a liveness property (one using `<>` or `~>`), so no progress is checked.
+
 ## Actions
 
 | # | Group | Action |

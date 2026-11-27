@@ -1274,6 +1274,7 @@
     }
   ],
   "properties": [],
+  "liveness": [],
   "errors": [],
   "ignored": [
     "AutoLeaveNotAppended",
